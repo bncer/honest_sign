@@ -5,6 +5,12 @@ use rustls::crypto::CryptoProvider;
 use sheets4::{Result, Sheets, yup_oauth2};
 use dotenv::dotenv;
 use std::env;
+use chrono::{NaiveDate, Days};
+
+fn sheets_serial_to_date(serial: f64) -> Option<NaiveDate> {
+    NaiveDate::from_ymd_opt(1899, 12, 30)?
+        .checked_add_days(Days::new(serial.trunc() as u64))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,32 +42,26 @@ async fn main() -> Result<()> {
     let hub = Sheets::new(client, auth);
 
     let spreadsheet_id = env::var("GOOGLE_SHEET_ID").expect("Google Sheets ID must be in .env file");
-    let range = "Sheet1!A1:C10";
+    let range = "Sheet1!A1:ZZ10";
 
     let result = hub
         .spreadsheets()
         .values_get(&spreadsheet_id, range)
-        .doit()
-        .await;
+        .value_render_option("UNFORMATTED_VALUE")
+        .doit().await?;
 
-    match result {
-        Ok((_response, value_range)) => {
-            if let Some(values) = value_range.values {
-                println!("Successfully retrieved data:");
-                for row in values {
-                    for cell in row {
-                        print!("{}\t", cell);
+    if let Some(values) = result.1.values {
+        if let Some(date_values) = values.get(0) {
+            for i in 1..date_values.len() { 
+                if let Some(serial_number) = date_values[i].as_f64() {
+                    if let Some(date) = sheets_serial_to_date(serial_number) {
+                        println!("Converted Date: {0}, {1}", i, date); 
+                    } else {
+                        println!("Failed to convert serial number.");
                     }
-                    println!();
                 }
-            } else {
-                println!("No data found in the specified range.");
             }
         }
-        Err(e) => {
-            eprintln!("Error retrieving data: {}", e);
-        }
     }
-
     Ok(())
 }
