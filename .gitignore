@@ -2,3 +2,7 @@
 *.json
 .env*
 debug
+
+*.txt
+*.pdf
+template/

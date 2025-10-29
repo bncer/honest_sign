@@ -7,7 +7,8 @@ use dotenv::dotenv;
 use std::env;
 use std::path::{Path, PathBuf};
 use chrono::{NaiveDate, Days};
-use lopdf::{Document, Object, Dictionary};
+use lopdf::dictionary;
+use lopdf::{Document, Object};
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -133,22 +134,38 @@ fn get_path_buf(orders: &[Order]) -> Vec<(String, Vec<PathBuf>)> {
 
 fn duplicate_pages(input: PathBuf, output: &str, copies: usize) {
     let doc = Document::load(input).unwrap();
+
     let pages: Vec<_> = doc.get_pages().values().cloned().collect();
+
     let mut new_doc = Document::with_version("1.5");
+
+    let catalog_id = new_doc.new_object_id();
+
+    let pages_id = new_doc.new_object_id();
+
+    new_doc.objects.insert(catalog_id, Object::Dictionary(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id
+    }));
+
     let mut new_pages = Vec::new();
 
-    let mut pages_dict = Dictionary::new();
-    pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-    pages_dict.set("Kids", Object::Array(Vec::new()));
-    pages_dict.set("Count", Object::Integer(0));
-    let pages_id = new_doc.add_object(Object::Dictionary(pages_dict));
-
-    let mut catalog_dict = Dictionary::new();
-    catalog_dict.set("Type", Object::Name(b"Catalog".to_vec()));
-    catalog_dict.set("Pages", Object::Reference(pages_id));
-    let catalog_id = new_doc.add_object(Object::Dictionary(catalog_dict));
-
-    new_doc.trailer.set("Root", Object::Reference(catalog_id));
+    let mut source_contents = Vec::new();
+    for &page_id in &pages {
+        if let Ok(page) = doc.get_dictionary(page_id) {
+            if let Ok(contents) = page.get(b"Contents") {
+                match contents {
+                    Object::Reference(id) => match doc.objects.get(id) {
+                        None | Some(Object::Stream(_)) => {
+                            source_contents.push(*id);
+                        },
+                        _ => println!("Can not parse content"),
+                    },
+                    _ => println!("Can not parse content"),
+                }
+            }
+        }
+    }
 
     for _ in 0..copies {
         for &page_id in &pages {
@@ -158,14 +175,32 @@ fn duplicate_pages(input: PathBuf, output: &str, copies: usize) {
         }
     }
 
-    let kids_array: Vec<Object> = new_pages.iter().map(|id| Object::Reference(*id)).collect();
-
-    let pages_obj = new_doc.get_object_mut(pages_id).unwrap();
-    if let Object::Dictionary(ref mut dict) = *pages_obj {
-        dict.set("Kids", Object::Array(kids_array));
-        dict.set("Count", Object::Integer((pages.len() * copies) as i64));
+    let mut new_contents = Vec::new();
+    for content_id in &source_contents {
+        let content = doc.get_object(*content_id).unwrap().to_owned();
+        let new_content_id = new_doc.add_object(content);
+        new_contents.push(new_content_id);
     }
 
+    for (i, page_id) in new_pages.iter().enumerate() {
+        let matching_content = new_contents[i % new_contents.len()];
+        if let Ok(Object::Dictionary(dict)) = new_doc.get_object_mut(*page_id) {
+            dict.set("Contents", Object::Reference(matching_content));
+        }
+    }
+
+    let kids_array: Vec<Object> = new_pages.iter().map(|id| Object::Reference(*id)).collect();
+
+    new_doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+        "Type" => "Pages",
+        "Kids" => Object::Array(kids_array),
+        "Count" => new_pages.len() as u32,
+    }));
+
+
+    new_doc.trailer.set("Root", catalog_id);
+
+    println!("{:#?}", new_doc.objects);
     new_doc.save(output).unwrap();
 }
 
@@ -180,7 +215,7 @@ async fn main() -> Result<()> {
 
     let sa_key_path = env::var("GOOGLE_CREDENTIALS").expect("Json file with Google credentials must be in .env file");
     let spreadsheet_id = env::var("GOOGLE_SHEET_ID").expect("Google Sheets ID must be in .env file");
-    let ranges = vec!["Сабира!A8:BW9", "Сабира!A16:BW29"];
+    let ranges = vec!["Sheet1!A8:BW9", "Sheet1!A16:BW29"];
     let date_of_order = "2025-09-23";
 
     let response = get_sheet_values(&sa_key_path, &spreadsheet_id, &ranges).await;
@@ -189,7 +224,7 @@ async fn main() -> Result<()> {
 
     let order_list = get_path_buf(&orders);
     
-    for (model, path) in order_list {
+    for (_model, path) in order_list {
         for file in path {
             println!("{:?}", file);
             if file.clone().into_os_string().into_string() == Ok("template/Карандаш35657/48.pdf".to_string()) {
