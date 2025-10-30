@@ -10,6 +10,7 @@ use chrono::{NaiveDate, Days};
 use lopdf::dictionary;
 use lopdf::{Document, Object};
 
+
 #[allow(dead_code)]
 #[derive(Debug)]
 struct Order {
@@ -182,12 +183,34 @@ fn duplicate_pages(input: PathBuf, output: &str, copies: usize) {
         new_contents.push(new_content_id);
     }
 
+    let mut font_pages = Vec::new();
+    for obj in &doc.objects {
+        if let Ok(obj_dict) = doc.get_dictionary(*obj.0) {
+            if let Ok(value) = obj_dict.get(b"Type") {
+                if *value == Object::from("Font") {
+                    let new_id = new_doc.add_object(obj.1.clone());
+                    font_pages.push(new_id);
+                }
+            }
+        }
+    }
+
+    let resources_id = new_doc.add_object(dictionary! {
+        "Font" => dictionary! {
+            "F0" => font_pages[0],
+            "F1" => font_pages[1],
+            "F2" => font_pages[2],
+        },
+    });
+
     for (i, page_id) in new_pages.iter().enumerate() {
         let matching_content = new_contents[i % new_contents.len()];
         if let Ok(Object::Dictionary(dict)) = new_doc.get_object_mut(*page_id) {
             dict.set("Contents", Object::Reference(matching_content));
+            dict.set("Resources", resources_id);
         }
     }
+
 
     let kids_array: Vec<Object> = new_pages.iter().map(|id| Object::Reference(*id)).collect();
 
@@ -226,7 +249,6 @@ async fn main() -> Result<()> {
     
     for (_model, path) in order_list {
         for file in path {
-            println!("{:?}", file);
             if file.clone().into_os_string().into_string() == Ok("template/Карандаш35657/48.pdf".to_string()) {
                 duplicate_pages(file, "output.pdf", 5);
             }
