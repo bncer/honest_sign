@@ -1,17 +1,19 @@
 extern crate google_sheets4 as sheets4;
 extern crate hyper;
 extern crate hyper_rustls;
+
+use std::env;
+use std::path::{Path, PathBuf};
+use std::fs;
+
 use rustls::crypto::CryptoProvider;
 use sheets4::{Result, Sheets, api::BatchGetValuesResponse, yup_oauth2};
 use dotenv::dotenv;
-use std::env;
-use std::path::{Path, PathBuf};
 use chrono::{NaiveDate, Days};
 use lopdf::dictionary;
 use lopdf::{Document, Object};
 
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct Order {
     date: NaiveDate,
@@ -19,11 +21,11 @@ struct Order {
     items: Vec<SizeQuantity>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct SizeQuantity {
     size: i64,
     quantity: i64,
+    file_path: PathBuf,
 }
 
 fn sheets_serial_to_date(serial: f64) -> Option<NaiveDate> {
@@ -79,6 +81,7 @@ fn parse_order(date_str: &str, response: BatchGetValuesResponse) -> Vec<Order> {
 
         let models: Vec<String> = first_range_data[1].iter().skip(1)
             .filter_map(|v| v.as_str().map(String::from))
+            .map(|model| model.replace('\n', ""))
             .collect();
 
 
@@ -90,13 +93,18 @@ fn parse_order(date_str: &str, response: BatchGetValuesResponse) -> Vec<Order> {
 
         let second_range_data = &value_ranges[1].values.as_ref().unwrap();
 
-        for row in second_range_data.iter().skip(2) {
+        let base_path = Path::new("template");
+        for row in second_range_data.iter() {
             let size = row.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
             if size == 0 { continue; }
+
             for col_index in 0..num_orders {
                 if let Some(quantity) = row.get(col_index + 1).and_then(|v| v.as_i64()) {
+                    let folder_name = parsed_orders[col_index].model.replace('\n', "");
+                    let model_dir = base_path.join(&folder_name);
                     if quantity > 0 {
-                        parsed_orders[col_index].items.push(SizeQuantity { size, quantity });
+                        let file_path = model_dir.join(format!("{}.pdf", size));
+                        parsed_orders[col_index].items.push(SizeQuantity { size, quantity, file_path });
                     }
                 }
             }
@@ -114,26 +122,8 @@ fn parse_order(date_str: &str, response: BatchGetValuesResponse) -> Vec<Order> {
     Vec::new()
 }
 
-fn get_path_buf(orders: &[Order]) -> Vec<(String, Vec<PathBuf>)> {
-    let base_path = Path::new("template");
-    let mut path_result = Vec::new();
 
-    for order in orders {
-        let folder_name = order.model.replace('\n', "");
-        let model_dir = base_path.join(&folder_name);
-        let files: Vec<PathBuf> = order
-                .items
-                .iter()
-                .map(|item| model_dir.join(format!("{}.pdf", item.size)))
-                .filter(|path| path.exists())
-                .collect();
-        path_result.push((folder_name, files));
-    }
-
-    path_result
-}
-
-fn duplicate_pages(input: PathBuf, output: &str, copies: usize) {
+fn duplicate_pages(input: PathBuf, output: &str, copies: i64) {
     let doc = Document::load(input).unwrap();
 
     let pages: Vec<_> = doc.get_pages().values().cloned().collect();
@@ -223,7 +213,6 @@ fn duplicate_pages(input: PathBuf, output: &str, copies: usize) {
 
     new_doc.trailer.set("Root", catalog_id);
 
-    println!("{:#?}", new_doc.objects);
     new_doc.save(output).unwrap();
 }
 
@@ -245,13 +234,12 @@ async fn main() -> Result<()> {
 
     let orders = parse_order(&date_of_order, response);
 
-    let order_list = get_path_buf(&orders);
-    
-    for (_model, path) in order_list {
-        for file in path {
-            if file.clone().into_os_string().into_string() == Ok("template/Карандаш35657/48.pdf".to_string()) {
-                duplicate_pages(file, "output.pdf", 5);
-            }
+    for order in orders {
+        let output_dir = format!("output/{0}/{1}", date_of_order, order.model);
+        fs::create_dir_all(&output_dir)?;
+        for item in order.items {
+            let output_path = format!("{}/output_{}.pdf", &output_dir, item.size);
+            duplicate_pages(item.file_path.to_path_buf(), &output_path, item.quantity/10);
         }
     }
 
