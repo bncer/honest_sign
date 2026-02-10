@@ -139,8 +139,8 @@ fn parse_order(date_str: &str, response: BatchGetValuesResponse) -> Vec<Order> {
 fn duplicate_pages(input: PathBuf, output: &str, copies: i64) {
     let mut doc = Document::load(input).unwrap();
 
-    let text = "Дата производства: ".to_string();
-    let other_text = "Дата производства: 18.12.2025".to_string();
+    let text = "Дата производства:".to_string();
+    let other_text = "Дата производства: 12.02.2026".to_string();
     let default_str = None;
 
     let page_count = doc.get_pages().len();
@@ -211,11 +211,21 @@ fn duplicate_pages(input: PathBuf, output: &str, copies: i64) {
         }
     }
 
+    for i in [0, 2] {
+        if let Ok(Object::Dictionary(desc_font)) = new_doc.get_object_mut(font_pages[i]) {
+            desc_font.set(
+                b"DescendantFonts",
+                Object::Array(vec![Object::Reference((font_pages[i + 1].0, 0))]),
+            );
+        }
+    }
+
     let resources_id = new_doc.add_object(dictionary! {
         "Font" => dictionary! {
             "F0" => font_pages[0],
             "F1" => font_pages[1],
             "F2" => font_pages[2],
+            "F3" => font_pages[3],
         },
     });
 
@@ -247,8 +257,8 @@ fn set_date(input: &str, output: &str) {
     let mut doc = Document::load(input).unwrap();
 
     doc.version = "1.4".to_string();
-    let text = "Дата производства: ".to_string();
-    let other_text = "Дата производства: 21.01.2026".to_string();
+    let text = "Дата производства:".to_string();
+    let other_text = "Дата производства: 12.02.2026".to_string();
     let default_str = None;
 
     let page_count = doc.get_pages().len();
@@ -270,8 +280,8 @@ async fn main() -> Result<()> {
         .expect("Json file with Google credentials must be in .env file");
     let spreadsheet_id =
         env::var("GOOGLE_SHEET_ID").expect("Google Sheets ID must be in .env file");
-    let ranges = vec!["Sheet1!A8:BW9", "Sheet1!A16:BW29"];
-    let date_of_order = "2026-01-14";
+    let ranges = vec!["Sheet1!A8:BW9", "Sheet1!A16:BW30"];
+    let date_of_order = "2026-02-06";
 
     let response = get_sheet_values(&sa_key_path, &spreadsheet_id, &ranges).await;
 
