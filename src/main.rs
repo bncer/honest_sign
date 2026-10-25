@@ -112,8 +112,9 @@ fn parse_order(date_str: &str, response: BatchGetValuesResponse) -> Vec<Order> {
                 if let Some(quantity) = row.get(col_index + 1).and_then(|v| v.as_i64()) {
                     let folder_name = parsed_orders[col_index].model.replace('\n', "");
                     let model_dir = base_path.join(&folder_name);
+                    let articule = folder_name.strip_prefix("Карандаш").unwrap_or(&folder_name);
                     if quantity > 0 {
-                        let file_path = model_dir.join(format!("{}.pdf", size));
+                        let file_path = model_dir.join(format!("{articule} {}.pdf", size));
                         parsed_orders[col_index].items.push(SizeQuantity {
                             size,
                             quantity,
@@ -140,7 +141,7 @@ fn duplicate_pages(input: PathBuf, output: &str, copies: i64) {
     let mut doc = Document::load(input).unwrap();
 
     let text = "Дата производства:".to_string();
-    let other_text = "Дата производства: 12.02.2026".to_string();
+    let other_text = "Дата производства: 27.05.2026".to_string();
     let default_str = None;
 
     let page_count = doc.get_pages().len();
@@ -258,7 +259,7 @@ fn set_date(input: &str, output: &str) {
 
     doc.version = "1.4".to_string();
     let text = "Дата производства:".to_string();
-    let other_text = "Дата производства: 12.02.2026".to_string();
+    let other_text = "Дата производства: 22.10.2026".to_string();
     let default_str = None;
 
     let page_count = doc.get_pages().len();
@@ -280,8 +281,8 @@ async fn main() -> Result<()> {
         .expect("Json file with Google credentials must be in .env file");
     let spreadsheet_id =
         env::var("GOOGLE_SHEET_ID").expect("Google Sheets ID must be in .env file");
-    let ranges = vec!["Sheet1!A8:BW9", "Sheet1!A16:BW30"];
-    let date_of_order = "2026-02-06";
+    let ranges = vec!["Sheet1!A8:CW9", "Sheet1!A17:CW31"];
+    let date_of_order = "2026-10-14";
 
     let response = get_sheet_values(&sa_key_path, &spreadsheet_id, &ranges).await;
 
