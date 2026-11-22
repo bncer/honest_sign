@@ -137,8 +137,100 @@ fn parse_order(date_str: &str, response: BatchGetValuesResponse) -> Vec<Order> {
     Vec::new()
 }
 
+/// The label templates have broken ToUnicode CMaps, which prevent
+/// `Document::replace_text` from working at all:
+///
+/// 1. The main label fonts (Identity-H) ship a CMap `<0000> <FFFF> <0000>`
+///    that maps every CID to U+0000, so lopdf decodes all text as NUL chars
+///    and never finds the search string. Rewrite such CMaps with a correct
+///    identity mapping (CID == Unicode code point for every glyph used in
+///    these labels: ASCII 0x20-0x7E and Cyrillic 0x410-0x45F).
+///
+/// 2. The CaptionBold font CMap contains 4-byte (odd-length hex) target
+///    strings like `<10300>` (UTF-16 surrogate pairs) which lopdf 0.38's
+///    CMap parser rejects, so `replace_text` fails with
+///    `ToUnicodeCMap(Parse(Error))` before touching any text. Drop the
+///    unparseable mapping lines; the CIDs actually used by that font are
+///    covered by the remaining ranges. ToUnicode only affects text
+///    extraction, not rendering.
+fn fix_broken_cmaps(doc: &mut Document) {
+    const CORRECT_CMAP: &[u8] = b"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo
+<</Registry (Adobe)
+/Ordering (UCS)
+/Supplement 0
+>> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+2 beginbfrange
+<0020> <007E> <0020>
+<0410> <045F> <0410>
+endbfrange
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end";
+
+    for (_, obj) in doc.objects.iter_mut() {
+        if let Object::Stream(stream) = obj {
+            let Ok(content) = stream.get_plain_content() else {
+                continue;
+            };
+            if !content.windows(9).any(|w| w == b"begincmap") {
+                continue;
+            }
+
+            if content.windows(20).any(|w| w == b"<0000> <FFFF> <0000>") {
+                stream.set_plain_content(CORRECT_CMAP.to_vec());
+                continue;
+            }
+
+            let text = String::from_utf8_lossy(&content).to_string();
+            let lines: Vec<&str> = text.lines().collect();
+            // Only mapping lines (bfrange/bfchar entries) start with '<';
+            // skip dictionary lines like `/CIDSystemInfo <<...>> def`.
+            let kept: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|line| !line.trim_start().starts_with('<') || !line_has_odd_hex_string(line))
+                .collect();
+            if kept.len() != lines.len() {
+                stream.set_plain_content(kept.join("\n").into_bytes());
+            }
+        }
+    }
+}
+
+/// Returns true if the line contains a `<...>` hex string with an odd number
+/// of hex digits, which lopdf's CMap parser cannot handle.
+fn line_has_odd_hex_string(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(end) = bytes[i..].iter().position(|&b| b == b'>') {
+                // hex digits are the bytes between '<' and '>'
+                if (end - 1) % 2 != 0 {
+                    return true;
+                }
+                i += end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn duplicate_pages(input: PathBuf, output: &str, copies: i64) {
     let mut doc = Document::load(input).unwrap();
+
+    fix_broken_cmaps(&mut doc);
 
     let text = "Дата производства:".to_string();
     let other_text = "Дата производства: 27.05.2026".to_string();
@@ -147,7 +239,8 @@ fn duplicate_pages(input: PathBuf, output: &str, copies: i64) {
     let page_count = doc.get_pages().len();
 
     for page_number in 1..page_count + 1 {
-        let _ = doc.replace_text(page_number as u32, &text, &other_text, default_str);
+        doc.replace_text(page_number as u32, &text, &other_text, default_str)
+            .expect("Failed to replace text");
     }
 
     let pages: Vec<_> = doc.get_pages().values().cloned().collect();
@@ -257,17 +350,38 @@ fn duplicate_pages(input: PathBuf, output: &str, copies: i64) {
 fn set_date(input: &str, output: &str) {
     let mut doc = Document::load(input).unwrap();
 
+    fix_broken_cmaps(&mut doc);
+
     doc.version = "1.4".to_string();
     let text = "Дата производства:".to_string();
-    let other_text = "Дата производства: 22.10.2026".to_string();
+    let other_text = "Дата производства: 17.11.2026".to_string();
     let default_str = None;
 
     let page_count = doc.get_pages().len();
 
     for page_number in 1..page_count + 1 {
-        let _ = doc.replace_text(page_number as u32, &text, &other_text, default_str);
+        doc.replace_text(page_number as u32, &text, &other_text, default_str)
+            .expect("Failed to replace text");
     }
     doc.save(&output).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_date_replaces_production_date() {
+        let out = "/tmp/honest_sign_test_output.pdf";
+        set_date("template/Карандаш35663/35663 38.pdf", out);
+
+        let doc = Document::load(out).unwrap();
+        let content = doc.get_page_content(doc.get_pages().values().next().copied().unwrap()).unwrap();
+        let text = String::from_utf8(content).unwrap().to_ascii_uppercase();
+        // "Дата производства: 17.11.2026" encoded as 2-byte CIDs
+        // (CID == Unicode code point for this font)
+        assert!(text.contains("04140430044204300020043F0440043E043804370432043E04340441044204320430003A002000310037002E00310031002E0032003000320036"));
+    }
 }
 
 #[tokio::main]
@@ -281,8 +395,8 @@ async fn main() -> Result<()> {
         .expect("Json file with Google credentials must be in .env file");
     let spreadsheet_id =
         env::var("GOOGLE_SHEET_ID").expect("Google Sheets ID must be in .env file");
-    let ranges = vec!["Sheet1!A8:CW9", "Sheet1!A17:CW31"];
-    let date_of_order = "2026-10-14";
+    let ranges = vec!["Sheet1!A8:CX9", "Sheet1!A17:CX31"];
+    let date_of_order = "2026-11-11";
 
     let response = get_sheet_values(&sa_key_path, &spreadsheet_id, &ranges).await;
 
