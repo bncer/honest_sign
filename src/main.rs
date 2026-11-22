@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use chrono::{Days, NaiveDate};
 use dotenv::dotenv;
 use lopdf::dictionary;
-use lopdf::{Document, Object};
+use lopdf::{Dictionary, Document, Object, ObjectId};
 use rustls::crypto::CryptoProvider;
 use sheets4::{Result, Sheets, api::BatchGetValuesResponse, yup_oauth2};
 
@@ -112,9 +112,9 @@ fn parse_order(date_str: &str, response: BatchGetValuesResponse) -> Vec<Order> {
                 if let Some(quantity) = row.get(col_index + 1).and_then(|v| v.as_i64()) {
                     let folder_name = parsed_orders[col_index].model.replace('\n', "");
                     let model_dir = base_path.join(&folder_name);
-                    let articule = folder_name.strip_prefix("Карандаш").unwrap_or(&folder_name);
                     if quantity > 0 {
-                        let file_path = model_dir.join(format!("{articule} {}.pdf", size));
+                        let file_path =
+                            model_dir.join(format!("{} {}.pdf", articule(&folder_name), size));
                         parsed_orders[col_index].items.push(SizeQuantity {
                             size,
                             quantity,
@@ -227,143 +227,119 @@ fn line_has_odd_hex_string(line: &str) -> bool {
     false
 }
 
-fn duplicate_pages(input: PathBuf, output: &str, copies: i64) {
-    let mut doc = Document::load(input).unwrap();
+/// Article number of a model: the digits at the end of its name,
+/// e.g. "Карандаш95811" -> "95811".
+fn articule(model: &str) -> &str {
+    model.trim_start_matches(|c: char| !c.is_ascii_digit())
+}
+
+/// Load a label template and write the production date into every page.
+fn load_with_date(input: &Path, production_date: &str) -> Document {
+    let mut doc = Document::load(input)
+        .unwrap_or_else(|e| panic!("Cannot open template {}: {e}", input.display()));
 
     fix_broken_cmaps(&mut doc);
 
-    let text = "Дата производства:".to_string();
-    let other_text = "Дата производства: 27.05.2026".to_string();
-    let default_str = None;
+    let text = "Дата производства:";
+    let other_text = format!("Дата производства: {production_date}");
 
-    let page_count = doc.get_pages().len();
-
-    for page_number in 1..page_count + 1 {
-        doc.replace_text(page_number as u32, &text, &other_text, default_str)
+    let page_count = doc.get_pages().len() as u32;
+    for page_number in 1..=page_count {
+        doc.replace_text(page_number, text, &other_text, None)
             .expect("Failed to replace text");
     }
+    doc
+}
 
-    let pages: Vec<_> = doc.get_pages().values().cloned().collect();
+/// Page attributes that a page can inherit from its parent `Pages` node.
+const INHERITABLE_PAGE_KEYS: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 
-    let mut new_doc = Document::with_version("1.5");
-
-    let catalog_id = new_doc.new_object_id();
-
-    let pages_id = new_doc.new_object_id();
-
-    new_doc.objects.insert(
-        catalog_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => pages_id
-        }),
-    );
-
-    let mut new_pages = Vec::new();
-
-    let mut source_contents = Vec::new();
-    for &page_id in &pages {
-        if let Ok(page) = doc.get_dictionary(page_id) {
-            if let Ok(contents) = page.get(b"Contents") {
-                match contents {
-                    Object::Reference(id) => match doc.objects.get(id) {
-                        None | Some(Object::Stream(_)) => {
-                            source_contents.push(*id);
-                        }
-                        _ => println!("Can not parse content"),
-                    },
-                    _ => println!("Can not parse content"),
+/// Copy of a page dictionary with inherited attributes filled in, so the page
+/// still renders the same after being moved into a different page tree.
+fn standalone_page(doc: &Document, page_id: ObjectId) -> Dictionary {
+    let mut page = doc.get_dictionary(page_id).unwrap().clone();
+    let mut parent = page.get(b"Parent").and_then(Object::as_reference).ok();
+    while let Some(parent_id) = parent {
+        let Ok(node) = doc.get_dictionary(parent_id) else {
+            break;
+        };
+        for key in INHERITABLE_PAGE_KEYS {
+            if !page.has(key) {
+                if let Ok(value) = node.get(key) {
+                    page.set(key, value.clone());
                 }
             }
         }
+        parent = node.get(b"Parent").and_then(Object::as_reference).ok();
     }
+    page
+}
 
-    for _ in 0..copies {
-        for &page_id in &pages {
-            let page = doc.get_object(page_id).unwrap().to_owned();
-            let new_id = new_doc.add_object(page);
-            new_pages.push(new_id);
-        }
-    }
+/// Build one PDF for an order. For every item (in the given order) the
+/// template's pages are repeated until there are `quantity` pages, e.g. 25
+/// labels from a 10-page template gives pages 1-10, 1-10, 1-5.
+///
+/// Repeated pages share the same content streams, fonts and images, so the
+/// file stays small no matter how many labels are needed.
+fn build_order_pdf(items: &[SizeQuantity], production_date: &str) -> Document {
+    let mut out = Document::with_version("1.5");
+    let pages_id = out.new_object_id();
+    let mut kids: Vec<Object> = Vec::new();
 
-    let mut new_contents = Vec::new();
-    for content_id in &source_contents {
-        let content = doc.get_object(*content_id).unwrap().to_owned();
-        let new_content_id = new_doc.add_object(content);
-        new_contents.push(new_content_id);
-    }
+    for item in items {
+        let mut doc = load_with_date(&item.file_path, production_date);
+        // Move this template's object ids past everything already in `out`.
+        doc.renumber_objects_with(out.max_id + 1);
 
-    let mut font_pages = Vec::new();
-    for obj in &doc.objects {
-        if let Ok(obj_dict) = doc.get_dictionary(*obj.0) {
-            if let Ok(value) = obj_dict.get(b"Type") {
-                if *value == Object::from("Font") {
-                    let new_id = new_doc.add_object(obj.1.clone());
-                    font_pages.push(new_id);
-                }
-            }
-        }
-    }
+        let source_pages: Vec<Dictionary> = doc
+            .get_pages()
+            .into_values()
+            .map(|id| standalone_page(&doc, id))
+            .collect();
+        assert!(
+            !source_pages.is_empty(),
+            "Template {} has no pages",
+            item.file_path.display()
+        );
 
-    for i in [0, 2] {
-        if let Ok(Object::Dictionary(desc_font)) = new_doc.get_object_mut(font_pages[i]) {
-            desc_font.set(
-                b"DescendantFonts",
-                Object::Array(vec![Object::Reference((font_pages[i + 1].0, 0))]),
+        // Take everything except the old catalog and page tree; the new
+        // pages below point at the same content, fonts and images.
+        for (id, object) in doc.objects {
+            out.max_id = out.max_id.max(id.0);
+            let is_page_tree = matches!(
+                object.type_name(),
+                Ok(b"Catalog") | Ok(b"Pages") | Ok(b"Page")
             );
+            if !is_page_tree {
+                out.objects.insert(id, object);
+            }
+        }
+
+        for i in 0..item.quantity as usize {
+            let mut page = source_pages[i % source_pages.len()].clone();
+            page.set("Parent", pages_id);
+            kids.push(Object::Reference(out.add_object(page)));
         }
     }
 
-    let resources_id = new_doc.add_object(dictionary! {
-        "Font" => dictionary! {
-            "F0" => font_pages[0],
-            "F1" => font_pages[1],
-            "F2" => font_pages[2],
-            "F3" => font_pages[3],
-        },
-    });
-
-    for (i, page_id) in new_pages.iter().enumerate() {
-        let matching_content = new_contents[i % new_contents.len()];
-        if let Ok(Object::Dictionary(dict)) = new_doc.get_object_mut(*page_id) {
-            dict.set("Contents", Object::Reference(matching_content));
-            dict.set("Resources", resources_id);
-        }
-    }
-
-    let kids_array: Vec<Object> = new_pages.iter().map(|id| Object::Reference(*id)).collect();
-
-    new_doc.objects.insert(
+    let count = kids.len() as i64;
+    out.objects.insert(
         pages_id,
         Object::Dictionary(dictionary! {
             "Type" => "Pages",
-            "Kids" => Object::Array(kids_array),
-            "Count" => new_pages.len() as u32,
+            "Kids" => Object::Array(kids),
+            "Count" => count,
         }),
     );
+    let catalog_id = out.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    out.trailer.set("Root", catalog_id);
 
-    new_doc.trailer.set("Root", catalog_id);
-
-    new_doc.save(output).unwrap();
-}
-
-fn set_date(input: &str, output: &str) {
-    let mut doc = Document::load(input).unwrap();
-
-    fix_broken_cmaps(&mut doc);
-
-    doc.version = "1.4".to_string();
-    let text = "Дата производства:".to_string();
-    let other_text = "Дата производства: 26.11.2026".to_string();
-    let default_str = None;
-
-    let page_count = doc.get_pages().len();
-
-    for page_number in 1..page_count + 1 {
-        doc.replace_text(page_number as u32, &text, &other_text, default_str)
-            .expect("Failed to replace text");
-    }
-    doc.save(&output).unwrap();
+    out.prune_objects();
+    out.compress();
+    out
 }
 
 #[cfg(test)]
@@ -371,16 +347,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_date_replaces_production_date() {
-        let out = "/tmp/honest_sign_test_output.pdf";
-        set_date("template/Карандаш35663/35663 38.pdf", out);
+    fn load_with_date_replaces_production_date() {
+        let doc = load_with_date(Path::new("template/Карандаш35663/35663 38.pdf"), "17.11.2026");
 
-        let doc = Document::load(out).unwrap();
         let content = doc.get_page_content(doc.get_pages().values().next().copied().unwrap()).unwrap();
         let text = String::from_utf8(content).unwrap().to_ascii_uppercase();
         // "Дата производства: 17.11.2026" encoded as 2-byte CIDs
         // (CID == Unicode code point for this font)
         assert!(text.contains("04140430044204300020043F0440043E043804370432043E04340441044204320430003A002000310037002E00310031002E0032003000320036"));
+    }
+
+    #[test]
+    fn build_order_pdf_repeats_pages_up_to_quantity() {
+        let item = |size: i64, quantity: i64| SizeQuantity {
+            size,
+            quantity,
+            file_path: PathBuf::from(format!("template/Карандаш35663/35663 {size}.pdf")),
+        };
+        let mut doc = build_order_pdf(&[item(38, 25), item(40, 10)], "17.11.2026");
+
+        // Round-trip through bytes to make sure the result is a valid PDF.
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+
+        let pages: Vec<ObjectId> = doc.get_pages().into_values().collect();
+        assert_eq!(pages.len(), 35);
+
+        let contents = |n: usize| doc.get_dictionary(pages[n]).unwrap().get(b"Contents").unwrap().clone();
+        // 25 labels from a 10-page template: 1-10, 1-10, 1-5
+        assert_eq!(contents(0), contents(10));
+        assert_eq!(contents(0), contents(20));
+        assert_eq!(contents(4), contents(24));
+        assert_ne!(contents(0), contents(1));
+        // The next size starts from its own template
+        assert_ne!(contents(25), contents(0));
+        assert_eq!(contents(25), contents(34 - 9));
     }
 }
 
@@ -399,24 +401,36 @@ async fn main() -> Result<()> {
     // and each following column is one order.
     let ranges = vec!["Sheet1!A8:DX9", "Sheet1!A17:DX31"];
     let date_of_order = "2026-11-18";
+    let production_date = "26.11.2026";
 
     let response = get_sheet_values(&sa_key_path, &spreadsheet_id, &ranges).await;
 
     let orders = parse_order(&date_of_order, response);
 
-    for order in orders {
-        let output_dir = format!("output/{0}/{1}", date_of_order, order.model);
-        fs::create_dir_all(&output_dir)?;
-        for item in order.items {
-            let output_path = format!("{}/output_{}.pdf", &output_dir, item.size);
-            println!("{:#?}", item.file_path.to_str().unwrap());
-            set_date(item.file_path.to_str().unwrap(), &output_path);
-            // duplicate_pages(
-            //     item.file_path.to_path_buf(),
-            //     &output_path,
-            //     item.quantity / 10,
-            // );
+    let output_dir = format!("output/{date_of_order}");
+    fs::create_dir_all(&output_dir)?;
+
+    for mut order in orders {
+        // Same order as `ls -v res_*.pdf`: smallest size first.
+        order.items.sort_by_key(|item| item.size);
+
+        let output_path = format!(
+            "{output_dir}/skirt_{}_{}.pdf",
+            order.date.format("%d_%m"),
+            articule(&order.model)
+        );
+
+        println!("{}:", order.model);
+        for item in &order.items {
+            println!("  {} x {}", item.file_path.display(), item.quantity);
         }
+
+        let mut doc = build_order_pdf(&order.items, production_date);
+        doc.save(&output_path)
+            .unwrap_or_else(|e| panic!("Cannot save {output_path}: {e}"));
+
+        let total: i64 = order.items.iter().map(|item| item.quantity).sum();
+        println!("  -> {output_path} ({total} pages)");
     }
 
     Ok(())
