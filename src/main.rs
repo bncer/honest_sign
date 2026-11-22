@@ -354,7 +354,7 @@ fn set_date(input: &str, output: &str) {
 
     doc.version = "1.4".to_string();
     let text = "Дата производства:".to_string();
-    let other_text = "Дата производства: 17.11.2026".to_string();
+    let other_text = "Дата производства: 26.11.2026".to_string();
     let default_str = None;
 
     let page_count = doc.get_pages().len();
@@ -395,8 +395,10 @@ async fn main() -> Result<()> {
         .expect("Json file with Google credentials must be in .env file");
     let spreadsheet_id =
         env::var("GOOGLE_SHEET_ID").expect("Google Sheets ID must be in .env file");
-    let ranges = vec!["Sheet1!A8:CX9", "Sheet1!A17:CX31"];
-    let date_of_order = "2026-11-11";
+    // Ranges must start at column A: column A holds the row labels / sizes,
+    // and each following column is one order.
+    let ranges = vec!["Sheet1!A8:DX9", "Sheet1!A17:DX31"];
+    let date_of_order = "2026-11-18";
 
     let response = get_sheet_values(&sa_key_path, &spreadsheet_id, &ranges).await;
 
